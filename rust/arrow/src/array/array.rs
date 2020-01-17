@@ -19,6 +19,7 @@ use std::any::Any;
 use std::convert::{From, TryFrom};
 use std::fmt;
 use std::io::Write;
+use std::iter::Iterator;
 use std::mem;
 use std::sync::Arc;
 
@@ -26,6 +27,7 @@ use chrono::prelude::*;
 
 use super::*;
 use crate::array::equal::JsonEqual;
+use crate::bitmap::Bitmap;
 use crate::buffer::{Buffer, MutableBuffer};
 use crate::datatypes::DataType::Struct;
 use crate::datatypes::*;
@@ -1641,6 +1643,91 @@ impl From<(Vec<(Field, ArrayRef)>, Buffer, usize)> for StructArray {
     }
 }
 
+/// Convert any iterator to a nullable iterator.
+#[derive(Debug, PartialEq)]
+struct NullableIterator<T: Iterator> {
+    iter: T,
+    i: usize,
+    null_bitmap: *const u8,
+}
+
+impl<T: Iterator> NullableIterator<T> {
+    fn from(iter: T, null_bitmap: &Option<Bitmap>, offset: usize) -> Self {
+        let i = offset;
+        let null_bitmap = if let &Some(ref null_bitmap) = null_bitmap {
+            null_bitmap.bits.data().as_ptr()
+        } else {
+            std::ptr::null()
+        };
+        Self {
+            iter,
+            i,
+            null_bitmap,
+        }
+    }
+}
+
+impl<T: Iterator> Iterator for NullableIterator<T> {
+    type Item = Option<T::Item>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let i = self.i;
+        let val = self.iter.next();
+        if let Some(val) = val {
+            self.i = i + 1;
+            unsafe {
+                if !self.null_bitmap.is_null()
+                    && *self.null_bitmap.offset((i >> 3) as isize) & (1 << (i & 7)) == 0
+                {
+                    // Return a null as None
+                    Some(None)
+                } else {
+                    // Return Some(val).
+                    Some(Some(val))
+                }
+            }
+        } else {
+            // End of iteration.
+            None
+        }
+    }
+}
+
+impl<'a, T: ArrowPrimitiveType + ArrowNumericType> PrimitiveArray<T> {
+    /// Generate a nullable slice iterato over the data.
+    /// Example:
+    /// '''
+    ///         let a = Int32Array::from(vec![5, 6, 7, 8, 9]);
+    ///         let b : Vec<_> = a.iter_some().collect();
+    ///         assert_eq!(b, vec![Some(5), Some(6), Some(7), Some(8), Some(9)]);
+    /// '''
+    fn iter_nulls(&self) -> NullableIterator<std::slice::Iter<T::Native>> {
+        NullableIterator::from(self.iter(), self.data().null_bitmap(), self.offset())
+    }
+
+    /// Generate a slice iterator over the data, ignoring nulls.
+    ///
+    /// Example:
+    /// '''
+    ///         let a = Int32Array::from(vec![5, 6, 7, 8, 9]);
+    ///         let b : Vec<_> = a.iter().map(|&v| v).collect();
+    ///         assert_eq!(b, vec![5, 6, 7, 8, 9]);
+    /// '''
+    fn iter(&self) -> std::slice::Iter<T::Native> {
+        self.value_slice(0, self.len()).iter()
+    }
+}
+
+/// Iterator over string array.
+/// This should be relatively efficient as it only uses raw pointers.
+#[derive(Debug, PartialEq)]
+struct StringIterator {
+    data: *const i32,
+    text: *const i8,
+    i: usize,
+    len: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2874,5 +2961,43 @@ mod tests {
 
         assert!(ret.is_ok());
         assert_eq!(8, ret.ok().unwrap());
+    }
+
+    #[test]
+    fn test_iter_some_all() {
+        let a = Int32Array::from(vec![5, 6, 7, 8, 9]);
+
+        let b: Vec<_> = a.iter_nulls().collect();
+        assert_eq!(b, vec![Some(&5), Some(&6), Some(&7), Some(&8), Some(&9)]);
+
+        let b: Vec<_> = a.iter().collect();
+        assert_eq!(b, vec![&5, &6, &7, &8, &9]);
+
+        let a = Int32Array::from(vec![Some(5), None, Some(7), Some(8), Some(9)]);
+        let b: Vec<_> = a.iter_nulls().collect();
+        assert_eq!(b, vec![Some(&5), None, Some(&7), Some(&8), Some(&9)]);
+    }
+
+    #[test]
+    fn test_iter_some_all_offset() {
+        let b = Int32Array::from(vec![Some(5), None, Some(7), Some(8), Some(9)]);
+        let b = b.slice(1, 2);
+        let b: Vec<_> = b
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter_nulls()
+            .collect();
+        assert_eq!(b, vec![None, Some(&7)]);
+
+        let b = Int32Array::from(vec![5, 6, 7, 8, 9]);
+        let b = b.slice(1, 2);
+        let b: Vec<_> = b
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(b, vec![&6, &7]);
     }
 }
