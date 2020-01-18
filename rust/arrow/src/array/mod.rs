@@ -79,6 +79,8 @@ pub use self::array::StructArray;
 
 pub(crate) use self::array::make_array;
 
+pub use self::array::Iterable;
+
 pub type BooleanArray = PrimitiveArray<BooleanType>;
 pub type Int8Array = PrimitiveArray<Int8Type>;
 pub type Int16Array = PrimitiveArray<Int16Type>;

@@ -1643,9 +1643,9 @@ impl From<(Vec<(Field, ArrayRef)>, Buffer, usize)> for StructArray {
     }
 }
 
-/// Convert any iterator to a nullable iterator.
-#[derive(Debug, PartialEq)]
-struct NullableIterator<T: Iterator> {
+/// Convert any iterator to a nullable iterator by using the null bitmap.
+#[derive(Debug, PartialEq, Clone)]
+pub struct NullableIterator<T: Iterator> {
     iter: T,
     i: usize,
     null_bitmap: *const u8,
@@ -1691,17 +1691,35 @@ impl<T: Iterator> Iterator for NullableIterator<T> {
             None
         }
     }
+
+    fn nth(&mut self, n : usize) -> Option<Self::Item> {
+        self.i += n;
+        self.iter.nth(n);
+        self.next()
+    }
 }
 
-impl<'a, T: ArrowPrimitiveType + ArrowNumericType> PrimitiveArray<T> {
-    /// Generate a nullable slice iterato over the data.
+pub trait Iterable<'a>
+where Self::IterType: std::iter::Iterator
+{
+    type IterType;
+
+    fn iter(&'a self) -> Self::IterType;
+    fn iter_nulls(&'a self) -> NullableIterator<Self::IterType>;
+}
+
+impl<'a, T: ArrowPrimitiveType + ArrowNumericType> Iterable<'a> for PrimitiveArray<T>
+{
+    type IterType = std::slice::Iter<'a, T::Native>;
+
+    /// Generate a nullable slice iterator over the data.
     /// Example:
     /// '''
     ///         let a = Int32Array::from(vec![5, 6, 7, 8, 9]);
     ///         let b : Vec<_> = a.iter_some().collect();
     ///         assert_eq!(b, vec![Some(5), Some(6), Some(7), Some(8), Some(9)]);
     /// '''
-    fn iter_nulls(&self) -> NullableIterator<std::slice::Iter<T::Native>> {
+    fn iter_nulls(&'a self) -> NullableIterator<Self::IterType> {
         NullableIterator::from(self.iter(), self.data().null_bitmap(), self.offset())
     }
 
@@ -1713,20 +1731,146 @@ impl<'a, T: ArrowPrimitiveType + ArrowNumericType> PrimitiveArray<T> {
     ///         let b : Vec<_> = a.iter().map(|&v| v).collect();
     ///         assert_eq!(b, vec![5, 6, 7, 8, 9]);
     /// '''
-    fn iter(&self) -> std::slice::Iter<T::Native> {
+    fn iter(&'a self) -> Self::IterType {
         self.value_slice(0, self.len()).iter()
     }
 }
 
 /// Iterator over string array.
 /// This should be relatively efficient as it only uses raw pointers.
-#[derive(Debug, PartialEq)]
-struct StringIterator {
-    data: *const i32,
-    text: *const i8,
+///
+/// Example:
+/// ```
+/// use arrow::array::{StringArray, Iterable};
+/// 
+/// let b = StringArray::from(vec!["a", "b", "c"]);
+/// let b : Vec<_> = b.iter().collect();
+/// assert_eq!(b, vec!["a", "b", "c"]);
+/// ```
+#[derive(Debug, PartialEq, Clone)]
+pub struct StringIterator {
+    value_offsets: *const i32,
+    value_data: *const u8,
     i: usize,
     len: usize,
 }
+
+impl Iterator for StringIterator {
+    type Item = &'static str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let i = self.i;
+        if i >= self.len {
+            None
+        } else {
+            self.i = i + 1;
+            unsafe {
+                let b = *self.value_offsets.offset(i as isize);
+                let e = *self.value_offsets.offset((i+1) as isize);
+                let data = self.value_data.offset(b as isize);
+                let len = (e - b) as usize;
+                let bytes = std::slice::from_raw_parts(data, len);
+                Some(std::str::from_utf8_unchecked(bytes))
+            }
+        }
+    }
+
+    fn nth(&mut self, n : usize) -> Option<Self::Item> {
+        self.i += n;
+        self.next()
+    }
+}
+
+impl<'a> Iterable<'a> for StringArray {
+    type IterType = StringIterator;
+    /// Generate a nullable iterator over the strings.
+    ///
+    /// Example:
+    /// ```
+    /// use arrow::array::{StringBuilder, StringArray, Iterable};
+    /// 
+    /// let mut b = StringBuilder::new(3);
+    /// b.append_value("a").unwrap();
+    /// b.append_null().unwrap();
+    /// b.append_value("c").unwrap();
+    /// let b : StringArray = b.finish();
+    /// let b : Vec<_> = b.iter_nulls().collect();
+    /// assert_eq!(b, vec![Some("a"), None, Some("c")]);
+    /// ```
+    fn iter_nulls(&'a self) -> NullableIterator<Self::IterType> {
+        NullableIterator::from(self.iter(), self.data().null_bitmap(), self.offset())
+    }
+
+    /// Generate an iterator over the strings, ignoring nulls.
+    ///
+    /// Example:
+    /// ```
+    /// use arrow::array::{StringArray, Iterable};
+    /// 
+    /// let b = StringArray::from(vec!["a", "b", "c"]);
+    /// let b : Vec<_> = b.iter().collect();
+    /// assert_eq!(b, vec!["a", "b", "c"]);
+    /// ```
+    fn iter(&'a self) -> Self::IterType {
+        StringIterator {
+            value_offsets: self.value_offsets.get(),
+            value_data: self.value_data.get(),
+            i: self.offset(),
+            len: self.len(),
+        }
+    }
+}
+
+/*
+/// A concrete ListArray reference
+struct ListRef<'a, I : Iterable<'a>>(&'a ListArray, &'static I);
+
+impl <'a, I : Iterable<'a>> ListRef<'a, I> {
+    fn try_from(array: &'a ListArray) -> Option<Self> {
+        if let Some(iterable) = array.values().as_any().downcast_ref::<I>() {
+            Some(ListRef(array, iterable))
+        } else {
+            None
+        }
+    }
+}
+*/
+
+#[derive(Debug, PartialEq)]
+pub struct ListIterator<VI : Iterator + Clone> {
+    value_offsets: *const i32,
+    i: usize,
+    len: usize,
+    values_iter: VI
+}
+
+impl <VI : Iterator + Clone> Iterator for ListIterator<VI> {
+    type Item = VI;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.values_iter.clone())
+    }
+}
+
+/*impl <'a, V: Iterable<'a>> Iterable<'a> for ListRef
+{
+    type IterType = ListIterator<V::IterType>;
+
+    fn iter(&self) -> Self::IterType {
+        let values : &V = self.values().as_any().downcast_ref::<V>().unwrap();
+        ListIterator {
+            value_offsets: self.value_offsets.get(),
+            i: self.offset(),
+            len: self.len(),
+            values_iter: values.iter()
+        }
+    }
+
+    fn iter_nulls(&self) -> NullableIterator<Self::IterType> {
+        NullableIterator::from(self.iter(), self.data().null_bitmap(), self.offset())
+    }
+}
+*/
 
 #[cfg(test)]
 mod tests {
@@ -2964,7 +3108,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_some_all() {
+    fn test_iter() {
         let a = Int32Array::from(vec![5, 6, 7, 8, 9]);
 
         let b: Vec<_> = a.iter_nulls().collect();
@@ -2979,7 +3123,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_some_all_offset() {
+    fn test_iter_offset() {
         let b = Int32Array::from(vec![Some(5), None, Some(7), Some(8), Some(9)]);
         let b = b.slice(1, 2);
         let b: Vec<_> = b
@@ -2999,5 +3143,48 @@ mod tests {
             .iter()
             .collect();
         assert_eq!(b, vec![&6, &7]);
+    }
+
+    #[test]
+    fn test_iter_string() {
+        let b = StringArray::from(vec!["a", "b", "c"]);
+        let b : Vec<_> = b.iter().collect();
+        assert_eq!(b, vec!["a", "b", "c"]);
+
+        /*let b = StringArray::from(vec![Some("a"), None, Some("c")]);
+        let b : Vec<_> = b.iter_nulls().collect();
+        assert_eq!(b, vec![Some("a"), None, Some("c")]);*/
+
+        let mut b = StringBuilder::new(3);
+        b.append_value("a").unwrap();
+        b.append_null().unwrap();
+        b.append_value("c").unwrap();
+        let b = b.finish();
+        let b : Vec<_> = b.iter_nulls().collect();
+        assert_eq!(b, vec![Some("a"), None, Some("c")]);
+    }
+
+
+    #[test]
+    fn test_iter_list() {
+        //let v : Vec<Vec<_>> = vv.into_iter().map(|v| v.into_iter().collect()).collect();
+        //assert_eq!(vv, v);
+
+        /*let string_builder = StringBuilder::new(3);
+        let mut list_of_string_builder = ListBuilder::new(string_builder);
+
+        list_of_string_builder.values().append_value("a").unwrap();
+        list_of_string_builder.values().append_value("b").unwrap();
+        list_of_string_builder.append(true).unwrap();
+
+        list_of_string_builder.values().append_value("c").unwrap();
+        list_of_string_builder.values().append_value("d").unwrap();
+        list_of_string_builder.append(true).unwrap();
+
+        let list_of_strings = list_of_string_builder.finish();
+
+        let b : Vec<Vec<&str>> = list_of_strings.iter().map(|v| v.collect()).collect();*/
+
+
     }
 }
